@@ -23,3 +23,6 @@ botpy.log
 nano.*.save
 .DS_Store
 uv.lock
+.nanobot/knowledge.sqlite3*
+knowledge/
+tool_routing_log.jsonl

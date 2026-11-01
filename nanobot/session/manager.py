@@ -198,6 +198,8 @@ class SessionManager:
                     data = json.loads(line)
 
                     if data.get("_type") == "metadata":
+                        if data.get("key", key) != key:
+                            return None  # Different keys can map to the same legacy filename.
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
@@ -218,6 +220,13 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
+        if path.is_file():
+            with open(path, encoding="utf-8") as existing:
+                first_line = existing.readline().strip()
+            if first_line:
+                header = json.loads(first_line)
+                if header.get("_type") == "metadata" and header.get("key", session.key) != session.key:
+                    raise ValueError("Session key conflicts with another stored session")
 
         with open(path, "w", encoding="utf-8") as f:
             metadata_line = {
@@ -245,9 +254,9 @@ class SessionManager:
         Returns:
             List of session info dicts.
         """
-        sessions = []
+        sessions = {}
 
-        for path in self.sessions_dir.glob("*.jsonl"):
+        for path in (*self.sessions_dir.glob("*.jsonl"), *self.legacy_sessions_dir.glob("*.jsonl")):
             try:
                 # Read just the metadata line
                 with open(path, encoding="utf-8") as f:
@@ -256,8 +265,9 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
+                            sessions.setdefault(key, {
                                 "key": key,
+                                "title": (data.get("metadata") or {}).get("title", ""),
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 "path": str(path)
@@ -265,4 +275,93 @@ class SessionManager:
             except Exception:
                 continue
 
-        return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+        return sorted(sessions.values(), key=lambda x: x.get("updated_at") or "", reverse=True)
+
+    def session_exists(self, key: str) -> bool:
+        """Check cache and both storage locations without creating a session."""
+        if key in self._cache:
+            return True
+        return self._get_session_path(key).is_file() or self._get_legacy_session_path(key).is_file()
+
+    def get_existing(self, key: str) -> Session | None:
+        """Read an existing session, without caching a new empty conversation."""
+        if key in self._cache:
+            return self._cache[key]
+        session = self._load(key)
+        if session is not None:
+            self._cache[key] = session
+        return session
+
+    def get_session_title(self, key: str) -> str | None:
+        """Get the title of a session if it has one."""
+        session = self.get_existing(key)
+        return session.metadata.get("title") if session is not None else None
+
+    @staticmethod
+    def get_default_session_key(channel: str, chat_id: str) -> str:
+        """Build a scope key, rejecting characters unsafe for persisted filenames."""
+        for part in (channel, chat_id):
+            if not isinstance(part, str) or not part or part != part.strip():
+                raise ValueError("channel and chat_id must be nonempty strings")
+            if ".." in part or any(ord(c) < 32 or ord(c) == 127 or c in '<>"/\\|?*' for c in part):
+                raise ValueError("Invalid characters in session context")
+        key = f"{channel}:{chat_id}"
+        if len(key.encode("utf-8")) > 240:
+            raise ValueError("Session context is too long for storage")
+        return key
+
+    def is_session_key_in_scope(self, channel: str, chat_id: str, key: str) -> bool:
+        """Allow the exact default or a named session with an explicit matching owner."""
+        base = self.get_default_session_key(channel, chat_id)
+        if not isinstance(key, str) or len(key.encode("utf-8")) > 240:
+            return False
+        if key == base:
+            return True
+        prefix = f"{base}:session:"
+        if not key.startswith(prefix):
+            return False
+        suffix = key[len(prefix):]
+        if not suffix or not all(c.isalnum() or c in "-_" for c in suffix):
+            return False
+        session = self.get_existing(key)
+        return session is not None and session.metadata.get("session_scope") == {
+            "channel": channel, "chat_id": chat_id,
+        }
+
+    def set_active_session_key(self, channel: str, chat_id: str, key: str) -> None:
+        """Persist a validated override on the default session for this chat or topic."""
+        base = self.get_default_session_key(channel, chat_id)
+        if key == base:
+            self.clear_active_session_key(channel, chat_id)
+            return
+        if not self.is_session_key_in_scope(channel, chat_id, key) or not (
+            self._get_session_path(key).is_file() or self._get_legacy_session_path(key).is_file()
+        ):
+            raise ValueError("Session does not exist or belongs to another chat")
+        session = self.get_or_create(base)
+        session.metadata["active_session_key"] = key
+        self.save(session)
+
+    def get_active_session_key(self, channel: str, chat_id: str) -> str | None:
+        """Restore a persisted override, falling back when its target is unavailable."""
+        base = self.get_default_session_key(channel, chat_id)
+        session = self.get_existing(base)
+        if session is None:
+            return None
+        key = session.metadata.get("active_session_key")
+        if key is None:
+            return None
+        if key != base and self.is_session_key_in_scope(channel, chat_id, key) and (
+            self._get_session_path(key).is_file() or self._get_legacy_session_path(key).is_file()
+        ):
+            return key
+        self.clear_active_session_key(channel, chat_id)
+        return None
+
+    def clear_active_session_key(self, channel: str, chat_id: str) -> None:
+        """Return to the default conversation without deleting any session history."""
+        base = self.get_default_session_key(channel, chat_id)
+        session = self.get_existing(base)
+        if session is not None and "active_session_key" in session.metadata:
+            session.metadata.pop("active_session_key")
+            self.save(session)

@@ -1,12 +1,11 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -465,6 +464,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -513,6 +513,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -542,6 +543,7 @@ def serve(
         web_search_config=runtime_config.tools.web.search,
         web_proxy=runtime_config.tools.web.proxy or None,
         exec_config=runtime_config.tools.exec,
+        tool_routing_config=runtime_config.tools.routing,
         restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=runtime_config.tools.mcp_servers,
@@ -629,6 +631,7 @@ def gateway(
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        tool_routing_config=config.tools.routing,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
@@ -835,6 +838,7 @@ def agent(
         web_search_config=config.tools.web.search,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        tool_routing_config=config.tools.routing,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,

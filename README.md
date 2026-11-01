@@ -148,6 +148,9 @@
 
 ## 📦 Install
 
+For local document RAG with citations, named conversations, and adaptive tool
+selection, see [Local knowledge and sessions](docs/local-knowledge-and-sessions.md).
+
 **Install from source** (latest features, recommended for development)
 
 ```bash

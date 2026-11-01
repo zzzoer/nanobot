@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -16,24 +15,32 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
-from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tool_router import ToolRouter
+from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.knowledge import KnowledgeSearchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.session_manage import SessionManageTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        ToolRoutingConfig,
+        WebSearchConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -54,6 +61,8 @@ class _LoopHook(AgentHook):
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        session_key: str | None = None,
+        session_scope_key: str | None = None,
     ) -> None:
         self._loop = agent_loop
         self._on_progress = on_progress
@@ -62,6 +71,8 @@ class _LoopHook(AgentHook):
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
+        self._session_key = session_key or f"{channel}:{chat_id}"
+        self._session_scope_key = session_scope_key or f"{channel}:{chat_id}"
         self._stream_buf = ""
 
     def wants_streaming(self) -> bool:
@@ -95,7 +106,15 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
+        self._loop._set_tool_context(
+            self._channel, self._chat_id, self._message_id,
+            session_scope_key=self._session_scope_key,
+        )
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        for event in context.tool_events:
+            if event.get("status") == "ok":
+                self._loop.tool_router.record_tool_usage(self._session_key, event["name"])
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)
@@ -174,8 +193,9 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
+        tool_routing_config: ToolRoutingConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, WebSearchConfig
+        from nanobot.config.schema import ExecToolConfig, ToolRoutingConfig, WebSearchConfig
 
         self.bus = bus
         self.channels_config = channels_config
@@ -196,6 +216,10 @@ class AgentLoop:
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.tool_routing_config = tool_routing_config or ToolRoutingConfig()
+        self.tool_router = ToolRouter(
+            log_dir=workspace, enable_logging=self.tool_routing_config.log_decisions,
+        )
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,
@@ -257,6 +281,8 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        self.tools.register(SessionManageTool(manager=self.sessions))
+        self.tools.register(KnowledgeSearchTool(self.workspace))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -280,12 +306,31 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    @staticmethod
+    def _session_scope(key: str) -> tuple[str, str] | None:
+        """Use explicit API/thread keys as scopes without changing transport routing."""
+        channel, separator, chat_id = key.partition(":")
+        if not separator:
+            return None
+        try:
+            SessionManager.get_default_session_key(channel, chat_id)
+        except ValueError:
+            return None
+        return channel, chat_id
+
+    def _set_tool_context(
+        self, channel: str, chat_id: str, message_id: str | None = None,
+        *, session_scope_key: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "session_manage"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "session_manage":
+                        scope = self._session_scope(session_scope_key or f"{channel}:{chat_id}")
+                        tool.set_context(*(scope or ("", "")))
+                    else:
+                        tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -316,6 +361,8 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        session_key: str | None = None,
+        session_scope_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -332,16 +379,48 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
+            session_key=session_key,
+            session_scope_key=session_scope_key,
         )
         hook: AgentHook = (
             _LoopHookChain(loop_hook, self._extra_hooks)
             if self._extra_hooks
             else loop_hook
         )
+        # Adaptive Tool Router: pre-filter tools based on user message
+        user_msg = ""
+        for m in reversed(initial_messages):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    user_msg = content
+                elif isinstance(content, list):
+                    user_msg = "\n".join(
+                        block["text"] for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                        and not block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                    )
+                if user_msg.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                    _, _, user_msg = user_msg.partition("\n\n")
+                break
+
+        if user_msg and self.tool_routing_config.enabled:
+            filtered_names = self.tool_router.route(
+                user_msg, self.tools.tool_names,
+                session_key=session_key or f"{channel}:{chat_id}",
+            )
+            filtered_tools = ToolRegistry()
+            for name in filtered_names:
+                if tool := self.tools.get(name):
+                    filtered_tools.register(tool)
+            run_tools = filtered_tools
+        else:
+            run_tools = self.tools
 
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
-            tools=self.tools,
+            tools=run_tools,
             model=self.model,
             max_iterations=self.max_iterations,
             hook=hook,
@@ -496,6 +575,7 @@ class AgentLoop:
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                session_key=key, session_scope_key=key,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
@@ -506,7 +586,10 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        key = session_key or msg.session_key
+        base_key = session_key or msg.session_key
+        scope = self._session_scope(base_key)
+        active_key = self.sessions.get_active_session_key(*scope) if scope else None
+        key = active_key if isinstance(active_key, str) else base_key
         session = self.sessions.get_or_create(key)
 
         # Slash commands
@@ -517,7 +600,10 @@ class AgentLoop:
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel, msg.chat_id, msg.metadata.get("message_id"),
+            session_scope_key=base_key,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -545,6 +631,7 @@ class AgentLoop:
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            session_key=key, session_scope_key=base_key,
         )
 
         if final_content is None:

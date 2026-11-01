@@ -76,6 +76,7 @@ class Nanobot:
             web_search_config=config.tools.web.search,
             web_proxy=config.tools.web.proxy or None,
             exec_config=config.tools.exec,
+            tool_routing_config=config.tools.routing,
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             timezone=defaults.timezone,
