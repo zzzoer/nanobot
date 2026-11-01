@@ -1,0 +1,46 @@
+name: Knowledge and session regression tests
+
+on:
+  push:
+    branches: ['codex/tool-routing-sessions']
+  pull_request:
+    paths:
+      - 'nanobot/agent/**'
+      - 'nanobot/session/**'
+      - 'nanobot/config/**'
+      - 'tests/agent/**'
+      - 'tests/tools/**'
+      - '.github/workflows/knowledge-sessions.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.11', '3.12', '3.13']
+        include:
+          - os: windows-latest
+            python-version: '3.12'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install core and development dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Exercise retrieval, routing, and session isolation
+        run: >-
+          python -m pytest
+          tests/agent/test_tool_router.py
+          tests/agent/test_knowledge_integration.py
+          tests/agent/test_loop_session_routing.py
+          tests/tools/test_session_manage.py
+          tests/tools/test_knowledge_tool.py
+          -q
