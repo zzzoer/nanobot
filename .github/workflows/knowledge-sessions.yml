@@ -2,7 +2,7 @@ name: Knowledge and session regression tests
 
 on:
   push:
-    branches: ['codex/tool-routing-sessions']
+    branches: ['codex/tool-routing-sessions', 'grounded']
   pull_request:
     paths:
       - 'nanobot/agent/**'
